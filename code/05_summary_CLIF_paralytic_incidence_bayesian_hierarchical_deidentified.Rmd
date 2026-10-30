@@ -1,0 +1,413 @@
+
+#Specify Project Location and File Type
+```{r}
+project_location <- 'Z:/barker/clif_paralytics'
+file_type <- 'csv'
+
+#Create Sub Folders within Project Folder
+# Check if the output directory exists; if not, create it
+if (!dir.exists(paste0(project_location, "/summary_analysis"))) {
+  dir.create(paste0(project_location, "/summary_analysis"))
+}
+```
+
+
+```{r Load Needed Libraries, include=FALSE}
+packages <- c( 
+  'marginaleffects',
+  'MetBrewer', 
+  'brms',
+  'rstanarm',
+  'ggpubr',
+  'data.table', 
+  'tidyverse',
+  'scales'
+)
+install_if_missing <- function(package) {
+  if (!require(package, character.only = TRUE)) {
+    install.packages(package, dependencies = TRUE)
+    library(package, character.only = TRUE)
+  }
+}
+
+sapply(packages, install_if_missing)
+rm(packages, install_if_missing)
+
+#Use Dplyr select as default
+select <- dplyr::select
+
+```
+
+```{r Load and Prepare Needed Data}
+df_agg <- read.csv(paste0(project_location, '/global_aggregate_expected_paralytics.csv')) |> #csv with data from each hospital generated from 02 script: hospital_id, prone_48, n_patients, observed_paralytic, paralytic_rate_observed, paralytic_rate_adjust, expected_paralytic, not_paralytic
+  
+  #Prepare to merge in Hospital Details
+  mutate(
+    hospital_id=fifelse(
+        hospital_id=='RUMC', 'Rush', hospital_id)
+    ) 
+
+clif_hospital_description <- read.csv(paste0(project_location, '/hospital_information_ma.csv')) |>
+    rename(Hospital_Type=hosp_type)
+
+#Merge Hospital Data Into DF AGG
+df_agg <- df_agg |>
+  left_join(clif_hospital_description %>% select(hospital_id, Hospital_Type))
+
+```
+
+```{r How Many Academic Hospitals are In These Data}
+#Do this Before Filtering
+df_unique_hosp <- df_agg |> distinct(hospital_id, Hospital_Type)
+cat('\nHow Many Academic v Community Hospitals are In These Data')
+table(df_unique_hosp$Hospital_Type)
+
+df_hosptype_summary <- df_agg |>
+  group_by(Hospital_Type, prone_48) |>
+  summarise(
+    n_Hospitals=n(),
+    n_patients=sum(n_patients, na.rm=T),
+    n_paralyzed=sum(observed_paralytic, na.rm=T),
+    percent_paralytic=round((n_paralyzed/n_patients)*100, 2)
+  ) |>
+  arrange(prone_48, Hospital_Type)
+df_hosptype_summary
+
+
+#Filter Out Hospitals with Less Than 10 Patients
+df_agg <- df_agg |>
+  #Filter OUT Hospitals with < 10 observations
+  filter(n_patients>=10)
+
+df_hosptype_summary_post <- df_agg |>
+  group_by(Hospital_Type, prone_48) |>
+  summarise(
+    n_Hospitals=n(),
+    n_patients=sum(n_patients, na.rm=T),
+    n_paralyzed=sum(observed_paralytic, na.rm=T),
+    percent_paralytic=round((n_paralyzed/n_patients)*100, 2)
+  ) |>
+  arrange(prone_48, Hospital_Type)
+
+```
+
+```{r Merge in the Proning Log Odds for Proned and Unproned Patients at Each Hospital}
+#Create Row For Each paralytic Summary Data and unparalyzed Summary Data
+df_agg_unparalyzed <- df_agg
+df_agg_paralyzed <- df_agg_unparalyzed %>%
+  mutate(n_patients = observed_paralytic, any_paralytic_48 = 1)
+df_agg_unparalyzed <- df_agg_unparalyzed |>
+  mutate(n_patients = not_paralytic, observed_paralytic = 0, any_paralytic_48 = 0)
+df_agg <- bind_rows(df_agg_paralyzed, df_agg_unparalyzed)
+
+#Merge in Paralytic Adjusted Rate for Each Hospital By paralyzed/Unparalyzed Status
+global_agg_byoutcome_prone <- read.csv(paste0(project_location, '/global_aggregate_paralytic_risk_by_outcome_prone.csv')) |>
+  mutate(paralytic_log_odds = log(paralytic_rate_adjust / (1 - paralytic_rate_adjust))) |>
+  select(hospital_id, any_paralytic_48, paralytic_log_odds, prone_48) |>
+  #Prepare to merge in Hospital Details
+  mutate(
+    hospital_id=fifelse(
+        hospital_id=='RUMC', 'Rush', hospital_id)
+    ) 
+
+#Merge Back with DF Agg
+df_agg <- left_join(df_agg, global_agg_byoutcome_prone) |>
+  #IF there were no patients paralyzed can use the propensity for unparalyzed patients by filling here
+  group_by(hospital_id, prone_48) |>
+  arrange(hospital_id, prone_48, any_paralytic_48) |>
+  fill(paralytic_log_odds, .direction = 'down') |>
+  ungroup()
+```
+
+```{r Now Bayesian Hierarchical Model Including Proning Status}
+#Bayesian Hierarchial Model with Random Effects for Hospital and Proning 
+set.seed(3)
+
+df_agg$prone_48 <- factor(
+  df_agg$prone_48,
+  levels = c(0, 1),
+  labels = c("Unproned", "Proned")
+)
+
+priors <- c(
+  #Unproned Paralytics Prior: Weakly Informative Centered Around Prob of Paralytics of 12% among unproned patients with 95% of prior probability in  5-50% range
+  prior(normal(-2, 1), class = "b", coef = 'prone_48Unproned'),  
+  #Proned Paralytics Prior: Weakly Informative Centered Around Prob of Paralytics of 50% among proned patients and with 95% of these probability ranging from 12-88%
+  prior(normal(0, 1), class = "b", coef = 'prone_48Proned'),
+  #Half Normal Weakly Informative but Regularizing Prior for Random Effects
+  prior(normal(0,1), class = "sd"))         
+
+#Bayesian Hierarchical Model with varying slopes by study_period and allowing for interaction term between hospital type and period
+agg_brm_paralytic_full <- brm(
+  bf(observed_paralytic | trials(n_patients) ~ 
+       0 + offset(paralytic_log_odds) + prone_48 + (0 + prone_48 | hospital_id)), 
+  data = df_agg,
+  family = binomial,
+  prior = priors, 
+  cores = 4,
+  control = list(adapt_delta = 0.99)
+)
+
+# Examine model fit and summaries
+plot(agg_brm_paralytic_full)
+summary(agg_brm_paralytic_full)
+
+#Now Generate Odds Ratios for Community vs Academic Proning by Period
+full_posterior <- as_draws_df(agg_brm_paralytic_full)
+
+mor_constant <- sqrt(2) * qnorm(0.75)  # approximately 0.954
+
+full_posterior <- full_posterior |>
+  mutate(
+    mor_unproned = exp(mor_constant * sd_hospital_id__prone_48Unproned),
+    mor_proned = exp(mor_constant * sd_hospital_id__prone_48Proned)
+  )
+
+summary_posterior <- bind_rows(
+  tibble(
+    variable = "Unproned",
+    median_or = median(full_posterior$mor_unproned),
+    conf.low = quantile(full_posterior$mor_unproned, 0.025),
+    conf.high = quantile(full_posterior$mor_unproned, 0.975)
+  ),
+  tibble(
+    variable = "Proned",
+    median_or = median(full_posterior$mor_proned),
+    conf.low = quantile(full_posterior$mor_proned, 0.025),
+    conf.high = quantile(full_posterior$mor_proned, 0.975)
+  )
+)
+
+print(summary_posterior)
+write.csv(summary_posterior, paste0(project_location, '/summary_output/summary_posterior.csv'))
+```
+
+```{r Caterpillar Plots Based on Full Adjustment (Including Hospital Type and Size)}
+####Predictions Command from Marginal Effects with 4000 posterior draws
+set.seed(4)
+
+reliability_adjust_full <- predictions(agg_brm_paralytic_full, 
+                                  type = 'response', ndraws=4000, re_formula =  ~ (0 + prone_48 | hospital_id))
+
+reliability_adjust_full <- as_tibble(reliability_adjust_full) |>
+  left_join(df_agg %>% 
+         select('hospital_id', 'Hospital_Type', 'paralytic_log_odds', 'prone_48', 'any_paralytic_48'), 
+         by = c('hospital_id', 'prone_48', 'paralytic_log_odds')) |>
+  
+  #Need to Recombine paralytic outcome Estimates into 1 Per Hospital and proning status
+  group_by(hospital_id, prone_48) |>
+  mutate(
+    estimate_add=sum(estimate, na.rm=T),
+    ci_low_add=sum(conf.low, na.rm=T),
+    ci_hi_add=sum(conf.high, na.rm=T),
+    n_patients=sum(n_patients, na.rm=T)
+  ) |>
+  arrange(hospital_id, prone_48, -any_paralytic_48) |> #This Arranges so Row Number 1 is the any_paralytic_48=1
+  filter(row_number()==1) |>
+  ungroup() |>
+  mutate(adjust_rate=estimate_add/n_patients) |>
+  mutate(ci_low=ci_low_add/n_patients) |>
+  mutate(ci_hi=ci_hi_add/n_patients) |>
+  #Orders for Graph
+  arrange(prone_48, adjust_rate) |>
+  mutate(hospital_rank=row_number()) |>
+  mutate(actual_rate=observed_paralytic/n_patients) |>
+  mutate(grouping='Actual Rate') |>
+  left_join(df_agg %>% select('hospital_id', 'Hospital_Type')) |>
+  distinct()
+
+break_points <- reliability_adjust_full |>
+  mutate(unprone_num=fcase(
+    row_number()!=1 & prone_48==0 & lead(prone_48)==1, hospital_rank)
+    ) |>
+  summarise(
+    unprone_num=mean(unprone_num,na.rm=T)+0.5)
+```
+
+```{r Stacked Caterpillar Plots}
+#Stack Caterpillar Plots Vertically
+vertical_data <- reliability_adjust_full |>
+  group_by(prone_48) |>
+  arrange(prone_48, adjust_rate) |>
+  mutate(hospital_rank=row_number()) |>
+  ungroup()
+
+stacked_data <- vertical_data |>
+  dplyr::mutate(
+    prone_48 = factor(
+      trimws(as.character(prone_48)),
+      levels = c("Unproned", "Proned")
+    )
+  ) |>
+  dplyr::group_by(prone_48) |>
+  dplyr::arrange(adjust_rate, hospital_id, .by_group = TRUE) |>
+  dplyr::mutate(
+    hospital_rank = dplyr::row_number()
+  ) |>
+  dplyr::ungroup()
+
+ajrccm_colors <- c(
+  "Unproned" = "#0072B2",  # blue
+  "Proned"   = "#D55E00"   # vermilion
+)
+
+stacked <- ggplot(
+  stacked_data,
+  aes(
+    x = hospital_rank,
+    y = adjust_rate
+  )
+) +
+
+  # Posterior 95% credible intervals
+  geom_linerange(
+    aes(
+      ymin = ci_low,
+      ymax = ci_hi,
+      color = prone_48
+    ),
+    linewidth = 0.65,
+    alpha = 0.65
+  ) +
+
+  # Adjusted hospital estimates
+  geom_point(
+    aes(
+      color = prone_48,
+      shape = Hospital_Type
+    ),
+    size = 2.5,
+    stroke = 0.8
+  ) +
+scale_color_manual(
+  name = "Proning status",
+  values = ajrccm_colors,
+  breaks = c("Unproned", "Proned"),
+  labels = c(
+    "Unproned" = "Not proned",
+    "Proned"   = "Proned"
+  ),
+  drop = FALSE
+) +
+
+  scale_x_continuous(
+    breaks = NULL,
+    expand = ggplot2::expansion(mult = c(0.01, 0.01))
+  ) +
+
+  scale_y_continuous(
+    breaks = seq(0, 1, by = 0.20),
+    labels = scales::percent_format(accuracy = 1),
+    expand = ggplot2::expansion(mult = c(0, 0.02))
+  ) +
+
+  # Display 0%–100% without deleting observations from the data
+  coord_cartesian(ylim = c(0, 1)) +
+
+  labs(
+  x = "Hospital Rank",
+  y = "Eligible Patients Receiving NMBAs Within 48 Hours, %",
+  shape = "Hospital type"
+) + 
+
+    guides(
+    color = guide_legend(
+      order = 1,
+      override.aes = list(alpha = 1, linewidth = 0.8)
+    ),
+    shape = guide_legend(order = 2)
+  ) +
+
+  theme_classic(
+    base_size = 10,
+    base_family = "Arial"
+  ) +
+
+  theme(
+    # Axes
+    axis.title = element_text(
+      size = 10,
+      color = "black"
+    ),
+    axis.title.x = element_text(
+      margin = margin(t = 8)
+    ),
+    axis.title.y = element_text(
+      margin = margin(r = 8)
+    ),
+    axis.text.y = element_text(
+      size = 9,
+      color = "black"
+    ),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.line = element_line(
+      color = "black",
+      linewidth = 0.4
+    ),
+
+    # Legend
+  legend.position = "inside",
+  legend.position.inside = c(0.02, 0.98),
+  legend.justification = c(0, 1),
+  legend.direction = "horizontal",
+  legend.box = "vertical",
+  legend.box.just = "left",
+  legend.background = element_rect(
+  fill = scales::alpha("white", 0.90),
+  color = NA
+),
+  legend.margin = margin(4, 6, 4, 6),
+  legend.spacing.y = unit(0.1, "cm"),
+  legend.title = element_text(size = 9, face = "bold"),
+  legend.text = element_text(size = 9),
+
+   
+
+    # Caption
+    plot.caption = element_text(
+      size = 8,
+      color = "black",
+      hjust = 0,
+      margin = margin(t = 8)
+    ),
+
+    plot.margin = margin(8, 10, 8, 8)
+  ) + 
+
+  theme(
+    text = element_text(family = "sans")
+  )
+
+ggsave(
+  filename = "stacked_caterpillar.pdf",
+  path = paste0(project_location, "/summary_output/graphs/"),
+  plot = stacked,
+  width = 12,
+  height = 6,
+  units = "in",
+  device = cairo_pdf
+)
+
+
+ggsave('stacked_caterpillar.jpg', path = paste0(project_location, "/summary_output/graphs/"), 
+  width = 12,
+  height = 6,
+  units = "in"
+)
+
+proned_data <- stacked_data %>% filter(prone_48=="Proned")
+sum_proned <- sum(proned_data$n_patients)
+sum_proned_paralytic <- sum(proned_data$observed_paralytic)
+sum_proned_paralytic/ sum_proned
+
+unproned_data <- stacked_data %>% filter(prone_48=="Unproned")
+sum_unproned <- sum(unproned_data$n_patients)
+sum_unproned_paralytic <- sum(unproned_data$observed_paralytic)
+sum_unproned_paralytic/ sum_unproned
+
+
+```
+
+
+
